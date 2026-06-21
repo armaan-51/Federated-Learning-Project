@@ -53,14 +53,14 @@ After training, the server exposes a **FastAPI REST endpoint** for real-time dia
 │  │  Hospital A │◄───────►│  • FedProx Aggregation     │  │
 │  │  (local DB) │         │  • Global DiabetesModel    │  │
 │  └─────────────┘         │  • FastAPI /predict        │  │
-│                          │    (port 5000)              │  │
+│                          │    (port 5000)             │  │
 │  ┌─────────────┐         │  • Flower gRPC             │  │
 │  │  CLIENT 2   │◄───────►│    (port 8080)             │  │
 │  │  Hospital B │         └────────────────────────────┘  │
 │  │  (local DB) │                                         │
 │  └─────────────┘                                         │
 │                                                          │
-│  ← Only model weights travel the network, never data →  │
+│  ← Only model weights travel the network, never data →   │
 └──────────────────────────────────────────────────────────┘
 ```
 
