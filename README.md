@@ -1,6 +1,6 @@
 # Federated Learning 
 
-Federated Learning A privacy-preserving machine learning system that predicts heart disease risk using federated learning.
+Federated Learning A privacy-preserving machine learning system that predicts diabetes risk using federated learning.
 This approach enables collaborative model training across multiple institutions while keeping sensitive patient data decentralized and secure. 
 This project implements a federated learning system using Flower to predict heart disease while keeping patient data decentralized. 
 
