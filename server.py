@@ -1,32 +1,35 @@
 """
-server.py — Federated Learning Server for Heart Disease / Diabetes Prediction
-==============================================================================
+server.py — Federated Learning Server for Diabetes Risk Prediction
+==================================================================
 
 This module starts the Flower (flwr) federated learning server and a FastAPI
 prediction endpoint.
 
 Responsibilities:
     - Define the global ``DiabetesModel`` neural network architecture.
-    - Implement the ``CustomFedProx`` aggregation strategy (extends FedProx),
+    - Implement ``CustomFedProx`` aggregation strategy (extends FedProx),
       which handles non-IID data distributions across hospital clients.
     - Coordinate multiple FL training rounds (default: 30).
-    - Expose a REST prediction API on port 5000 via FastAPI + Uvicorn.
-    - Save the final aggregated global model to disk after training.
+    - Expose REST endpoints on port 5000 via FastAPI + Uvicorn:
+        GET  /         — HTML prediction form
+        POST /predict  — Diabetes risk prediction
+        GET  /health   — Server and training status
+        GET  /metrics  — Latest per-round training metrics
+    - Save best model checkpoints per round to checkpoints/
+    - Append per-round metrics to training_history.json
 
 Usage::
 
     python server.py
 
-The server will:
-    1. Bind the Flower gRPC server to ``0.0.0.0:8080`` (clients connect here).
-    2. Start FastAPI on ``0.0.0.0:5000`` (prediction endpoint).
-    3. Wait for at least 2 clients before starting training rounds.
-
 See Also:
     client.py      — FL client implementation
+    config.py      — All hyperparameters and paths
     docs/architecture.md — In-depth architecture documentation
 """
 
+import os
+import json
 import time
 import flwr as fl
 import torch.nn as nn
@@ -36,74 +39,73 @@ import logging
 import numpy as np
 from typing import Dict, List, Optional, Tuple, Union
 from flwr.server.strategy import FedProx
-from flwr.server.client_manager import SimpleClientManager
 from flwr.server.history import History
-from flwr.common import Parameters, Scalar, FitRes, Parameters, NDArrays
+from flwr.common import Parameters, Scalar, FitRes, NDArrays
 from flwr.server.strategy.aggregate import aggregate, weighted_loss_avg
 
+import config
+
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Training state (shared between FL callbacks and FastAPI endpoints)
+# ---------------------------------------------------------------------------
+_training_state: Dict = {
+    "current_round": 0,
+    "total_rounds": config.NUM_ROUNDS,
+    "training_complete": False,
+    "best_accuracy": 0.0,
+    "latest_metrics": {},
+    "history": [],
+}
 
 
 class DiabetesModel(nn.Module):
-    """Feed-forward neural network for binary diabetes / heart disease classification.
+    """Feed-forward neural network for binary diabetes risk classification.
 
-    Architecture:
-        - Layer 1: Linear(input_size → 32) + LeakyReLU + BatchNorm + Dropout(0.5)
-        - Layer 2: Linear(32 → 16)        + LeakyReLU + BatchNorm + Dropout(0.4)
-        - Layer 3: Linear(16 → 8)         + LeakyReLU + BatchNorm + Dropout(0.3)
-        - Output:  Linear(8 → num_classes)
+    Architecture (input → hidden → output):
+        Layer 1: Linear(input_size→32) + LeakyReLU + BatchNorm + Dropout(0.5)
+        Layer 2: Linear(32→16)         + LeakyReLU + BatchNorm + Dropout(0.4)
+        Layer 3: Linear(16→8)          + LeakyReLU + BatchNorm + Dropout(0.3)
+        Output:  Linear(8→num_classes) — raw logits
 
-    Dropout rates decrease with depth to allow the network to form increasingly
-    abstract representations with less noise in later layers.
+    Weights initialised with Kaiming Normal (optimal for LeakyReLU).
 
     Args:
-        input_size (int): Number of input features. Default is 8 (Pima dataset).
-        num_classes (int): Number of output classes. Default is 2 (binary).
-
-    Example::
-
-        model = DiabetesModel(input_size=8, num_classes=2)
-        x = torch.randn(16, 8)   # batch of 16 samples
-        logits = model(x)         # shape: (16, 2)
+        input_size (int): Number of input features. Default: 8 (Pima dataset).
+        num_classes (int): Number of output classes. Default: 2 (binary).
     """
 
-    def __init__(self, input_size: int = 8, num_classes: int = 2):
+    def __init__(self, input_size: int = config.INPUT_SIZE, num_classes: int = config.NUM_CLASSES):
         super(DiabetesModel, self).__init__()
         self.layer1 = nn.Sequential(
             nn.Linear(input_size, 32),
-            nn.LeakyReLU(0.1),
+            nn.LeakyReLU(config.LEAKY_RELU_SLOPE),
             nn.BatchNorm1d(32),
-            nn.Dropout(0.5)
+            nn.Dropout(config.DROPOUT_L1),
         )
         self.layer2 = nn.Sequential(
             nn.Linear(32, 16),
-            nn.LeakyReLU(0.1),
+            nn.LeakyReLU(config.LEAKY_RELU_SLOPE),
             nn.BatchNorm1d(16),
-            nn.Dropout(0.4)
+            nn.Dropout(config.DROPOUT_L2),
         )
         self.layer3 = nn.Sequential(
             nn.Linear(16, 8),
-            nn.LeakyReLU(0.1),
+            nn.LeakyReLU(config.LEAKY_RELU_SLOPE),
             nn.BatchNorm1d(8),
-            nn.Dropout(0.3)
+            nn.Dropout(config.DROPOUT_L3),
         )
         self.output = nn.Linear(8, num_classes)
-
-        # Initialize weights using Kaiming Normal (optimal for LeakyReLU)
         self._init_weights()
 
     def _init_weights(self) -> None:
-        """Initialise layer weights using Kaiming Normal for Linear layers.
-
-        BatchNorm layers are initialised with weight=1 and bias=0 (identity
-        transform), which is standard practice to avoid disrupting the initial
-        feature distributions.
-        """
+        """Initialise weights with Kaiming Normal; BatchNorm with identity."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="leaky_relu")
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.BatchNorm1d):
@@ -111,18 +113,13 @@ class DiabetesModel(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass through all layers.
-
-        Automatically handles single-sample (1-D) input by unsqueezing to add
-        a batch dimension, which is required by BatchNorm1d.
+        """Forward pass. Handles single-sample 1-D input by unsqueezing.
 
         Args:
-            x (torch.Tensor): Input tensor of shape ``(batch_size, input_size)``
-                or ``(input_size,)`` for a single sample.
+            x: Shape ``(batch_size, input_size)`` or ``(input_size,)``.
 
         Returns:
-            torch.Tensor: Raw logits of shape ``(batch_size, num_classes)``.
-                Apply ``torch.softmax`` to convert to probabilities.
+            Raw logits of shape ``(batch_size, num_classes)``.
         """
         if x.dim() == 1:
             x = x.unsqueeze(0)
@@ -132,124 +129,134 @@ class DiabetesModel(nn.Module):
         return self.output(x)
 
 
-# Initialize global model with 8 features (Pima dataset columns)
-model = DiabetesModel(input_size=8, num_classes=2)
+# ---------------------------------------------------------------------------
+# Global model (initialised once; kept in sync after every aggregation)
+# ---------------------------------------------------------------------------
+model = DiabetesModel(input_size=config.INPUT_SIZE, num_classes=config.NUM_CLASSES)
+logger.info("Server model architecture:\n%s", model)
 
 
-def init_weights(m: nn.Module) -> None:
-    """Apply Xavier Uniform initialisation to Linear layers.
-
-    Used as an alternative weight init applied via ``model.apply(init_weights)``.
-    Xavier Uniform works well for symmetric activation functions (tanh, sigmoid).
-
-    Args:
-        m (nn.Module): A module whose weights will be initialised in-place.
-    """
-    if isinstance(m, nn.Linear):
-        torch.nn.init.xavier_uniform_(m.weight)
-        if m.bias is not None:
-            m.bias.data.zero_()
-    elif isinstance(m, nn.BatchNorm1d):
-        m.weight.data.fill_(1.0)
-        m.bias.data.zero_()
-
-
-model.apply(init_weights)
-
-logger.info("Server model architecture:")
-logger.info(model)
-
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
 
 def get_initial_parameters(model: nn.Module) -> list:
-    """Extract model parameters as a list of numpy arrays.
-
-    Parameters are detached from the computation graph and moved to CPU before
-    conversion to avoid issues with GPU tensors and in-place modifications.
+    """Extract model parameters as detached CPU numpy arrays.
 
     Args:
-        model (nn.Module): The PyTorch model whose parameters to extract.
+        model: PyTorch model to extract parameters from.
 
     Returns:
-        list[np.ndarray]: List of parameter arrays, one per trainable layer.
+        List of numpy arrays, one per trainable parameter tensor.
     """
     return [p.detach().cpu().numpy().copy() for p in model.parameters()]
 
 
 def weighted_average(metrics: List[Tuple[int, Dict[str, Scalar]]]) -> Dict[str, Scalar]:
-    """Compute a weighted average of per-client accuracy metrics.
-
-    Weights are proportional to the number of examples each client evaluated on,
-    ensuring larger clients contribute proportionally more to the aggregate metric.
+    """Compute weighted mean accuracy across clients.
 
     Args:
-        metrics (list): List of ``(num_examples, metrics_dict)`` tuples from each
-            client's ``evaluate()`` call.
+        metrics: List of ``(num_examples, metrics_dict)`` tuples.
 
     Returns:
-        dict: ``{"accuracy": float}`` — the weighted mean accuracy across all clients.
-
-    Example::
-
-        metrics = [(100, {"accuracy": 0.80}), (200, {"accuracy": 0.90})]
-        result = weighted_average(metrics)
-        # result == {"accuracy": 0.8667}  (200-sample client weighs more)
+        ``{"accuracy": float}`` — weighted mean accuracy.
     """
-    accuracies = [num_examples * m["accuracy"] for num_examples, m in metrics]
-    examples = [num_examples for num_examples, _ in metrics]
+    accuracies = [n * m["accuracy"] for n, m in metrics]
+    examples = [n for n, _ in metrics]
     return {"accuracy": sum(accuracies) / sum(examples)}
 
 
 def fit_config(server_round: int) -> Dict[str, Scalar]:
-    """Build the training configuration dict sent to clients before each fit round.
+    """Build training config sent to clients before each fit round.
 
     Args:
-        server_round (int): The current FL round number (1-indexed).
+        server_round: Current FL round number (1-indexed).
 
     Returns:
-        dict: Configuration with keys ``round`` and ``epochs``.
+        Config dict with ``round``, ``epochs``, and ``proximal_mu``.
     """
+    _training_state["current_round"] = server_round
     return {
         "round": server_round,
-        "epochs": 1,
+        "epochs": config.LOCAL_EPOCHS,
+        "proximal_mu": config.PROXIMAL_MU,
+        "batch_size": config.BATCH_SIZE,
+        "weight_decay": config.WEIGHT_DECAY,
     }
 
 
 def evaluate_config(server_round: int) -> Dict[str, Scalar]:
-    """Build the evaluation configuration dict sent to clients before each evaluate round.
+    """Build evaluation config sent to clients before each evaluate round.
 
     Args:
-        server_round (int): The current FL round number (1-indexed).
+        server_round: Current FL round number (1-indexed).
 
     Returns:
-        dict: Configuration with key ``round``.
+        Config dict with ``round`` key.
     """
     return {"round": server_round}
 
 
-class CustomFedProx(FedProx):
-    """Custom FedProx strategy with in-memory global model updates.
+def _save_checkpoint(round_num: int, accuracy: float) -> None:
+    """Save a model checkpoint if accuracy improved.
 
-    Extends Flower's built-in ``FedProx`` strategy to additionally update an
-    in-memory ``DiabetesModel`` instance after every aggregation step. This
-    global model is used by the FastAPI prediction endpoint.
-
-    FedProx adds a proximal term ``(μ/2) · ‖w_local − w_global‖²`` to each
-    client's loss function, preventing client drift on non-IID data.
+    Checkpoints are written to ``config.CHECKPOINTS_DIR/model_round_{N}.pth``.
+    Only saves if the current round accuracy beats the best seen so far.
 
     Args:
-        *args: Passed through to ``FedProx.__init__``.
-        **kwargs: Passed through to ``FedProx.__init__``.
+        round_num: Current FL round number.
+        accuracy: Aggregated accuracy for this round.
+    """
+    os.makedirs(config.CHECKPOINTS_DIR, exist_ok=True)
+    if accuracy > _training_state["best_accuracy"]:
+        _training_state["best_accuracy"] = accuracy
+        path = os.path.join(config.CHECKPOINTS_DIR, f"model_round_{round_num}.pth")
+        torch.save(model.state_dict(), path)
+        logger.info("✅ New best model saved: %s (accuracy=%.4f)", path, accuracy)
 
-    Attributes:
-        global_test_loader: Reserved for optional server-side evaluation loader.
-        device (torch.device): CPU or CUDA device for the global model.
-        global_model (DiabetesModel): In-memory global model kept in sync with
-            the aggregated Flower parameters.
+
+def _append_history(round_num: int, metrics: Dict) -> None:
+    """Append round metrics to training_history.json and in-memory state.
+
+    Args:
+        round_num: Current FL round number.
+        metrics: Aggregated metrics dict for this round.
+    """
+    entry = {"round": round_num, **metrics}
+    _training_state["history"].append(entry)
+    _training_state["latest_metrics"] = entry
+
+    try:
+        history = []
+        if os.path.exists(config.TRAINING_HISTORY_PATH):
+            with open(config.TRAINING_HISTORY_PATH, "r") as f:
+                history = json.load(f)
+        history.append(entry)
+        with open(config.TRAINING_HISTORY_PATH, "w") as f:
+            json.dump(history, f, indent=2)
+    except Exception as e:
+        logger.warning("Could not write training history: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Custom FedProx Strategy
+# ---------------------------------------------------------------------------
+
+class CustomFedProx(FedProx):
+    """FedProx strategy that syncs the in-memory global model and saves checkpoints.
+
+    Extends Flower's ``FedProx`` to:
+    - Update the global ``DiabetesModel`` after every aggregation.
+    - Save model checkpoints when accuracy improves.
+    - Persist per-round metrics to ``training_history.json``.
+    - Correctly pass the ``proximal_mu`` config to clients via ``FitIns``.
+
+    Args:
+        *args, **kwargs: Forwarded to ``FedProx.__init__``.
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.global_test_loader = None
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.global_model = model.to(self.device)
 
@@ -259,193 +266,191 @@ class CustomFedProx(FedProx):
         results: List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.FitRes]],
         failures: List[Union[Tuple[fl.server.client_proxy.ClientProxy, fl.common.FitRes], BaseException]],
     ) -> Tuple[Optional[Parameters], Dict[str, Scalar]]:
-        """Aggregate client model updates and sync the in-memory global model.
-
-        Delegates the actual aggregation to the parent ``FedProx.aggregate_fit``,
-        then loads the resulting parameters into ``self.global_model`` so that the
-        FastAPI prediction endpoint always serves the latest aggregated weights.
+        """Aggregate client updates, sync global model, save checkpoint.
 
         Args:
-            server_round (int): Current FL round number.
-            results (list): Successful client (proxy, FitRes) pairs.
-            failures (list): Failed clients or exceptions from this round.
+            server_round: Current FL round number.
+            results: Successful (client_proxy, FitRes) pairs.
+            failures: Failed clients or exceptions.
 
         Returns:
-            tuple: ``(aggregated_parameters, metrics_aggregated)`` where
-                ``aggregated_parameters`` is a Flower ``Parameters`` object or
-                ``None`` if no results were received.
+            (aggregated_parameters, metrics_aggregated) or (None, {}) if no results.
         """
         if not results:
             return None, {}
 
-        aggregated_parameters, metrics_aggregated = super().aggregate_fit(server_round, results, failures)
+        aggregated_parameters, metrics_aggregated = super().aggregate_fit(
+            server_round, results, failures
+        )
 
         if aggregated_parameters is not None:
+            # Sync global model with new aggregated weights
             parameters = fl.common.parameters_to_ndarrays(aggregated_parameters)
             params_dict = zip(self.global_model.state_dict().keys(), parameters)
-            state_dict = {k: torch.tensor(v) if isinstance(v, np.ndarray) else v
-                         for k, v in params_dict}
+            state_dict = {
+                k: torch.tensor(v) if isinstance(v, np.ndarray) else v
+                for k, v in params_dict
+            }
             self.global_model.load_state_dict(state_dict, strict=True)
+
+            # Save checkpoint if accuracy improved
+            accuracy = metrics_aggregated.get("accuracy", 0.0)
+            _save_checkpoint(server_round, accuracy)
+            _append_history(server_round, {"accuracy": accuracy})
 
         return aggregated_parameters, metrics_aggregated
 
     def configure_fit(
-        self, server_round: int, parameters: Parameters, client_manager: fl.server.client_manager.ClientManager
+        self,
+        server_round: int,
+        parameters: Parameters,
+        client_manager: fl.server.client_manager.ClientManager,
     ) -> List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.FitIns]]:
         """Configure clients for the upcoming fit round.
 
-        Passes the ``proximal_mu`` hyperparameter to clients so they can apply
-        the FedProx proximal regularisation term in their local loss.
+        FIX: Previously built a ``config`` dict but never passed it to the parent,
+        so ``proximal_mu`` was never sent to clients. Now correctly creates
+        ``FitIns`` with the config and returns it directly.
 
         Args:
-            server_round (int): Current FL round number.
-            parameters (Parameters): Current global model parameters.
-            client_manager (ClientManager): Manages available client proxies.
+            server_round: Current FL round number.
+            parameters: Current global model parameters.
+            client_manager: Manages available client proxies.
 
         Returns:
-            list: ``[(client_proxy, FitIns), ...]`` for each sampled client.
+            List of (client_proxy, FitIns) for each sampled client.
         """
-        config = {
+        config_dict = {
             "round": server_round,
-            "epochs": 1,
-            "proximal_mu": 0.1,
+            "epochs": config.LOCAL_EPOCHS,
+            "proximal_mu": config.PROXIMAL_MU,
+            "batch_size": config.BATCH_SIZE,
+            "weight_decay": config.WEIGHT_DECAY,
         }
-        return super().configure_fit(server_round, parameters, client_manager)
+        fit_ins = fl.common.FitIns(parameters, config_dict)
+        clients = client_manager.sample(
+            num_clients=max(
+                config.MIN_FIT_CLIENTS,
+                int(self.fraction_fit * client_manager.num_available()),
+            ),
+            min_num_clients=config.MIN_FIT_CLIENTS,
+        )
+        return [(client, fit_ins) for client in clients]
 
     def configure_evaluate(
-        self, server_round: int, parameters: Parameters, client_manager: fl.server.client_manager.ClientManager
+        self,
+        server_round: int,
+        parameters: Parameters,
+        client_manager: fl.server.client_manager.ClientManager,
     ) -> List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.EvaluateIns]]:
-        """Configure a subset of clients for evaluation after aggregation.
+        """Configure clients for post-aggregation evaluation.
 
         Args:
-            server_round (int): Current FL round number.
-            parameters (Parameters): Aggregated global model parameters to evaluate.
-            client_manager (ClientManager): Manages available client proxies.
+            server_round: Current FL round number.
+            parameters: Aggregated global model parameters.
+            client_manager: Manages available client proxies.
 
         Returns:
-            list: ``[(client_proxy, EvaluateIns), ...]`` for each sampled client.
+            List of (client_proxy, EvaluateIns) for each sampled client.
         """
-        config = {"round": server_round}
+        eval_config = {"round": server_round}
         clients = client_manager.sample(
-            num_clients=min(self.min_evaluate_clients, client_manager.num_available()),
-            min_num_clients=self.min_evaluate_clients,
+            num_clients=min(config.MIN_EVALUATE_CLIENTS, client_manager.num_available()),
+            min_num_clients=config.MIN_EVALUATE_CLIENTS,
         )
-        return [(client, fl.common.EvaluateIns(parameters, config)) for client in clients]
+        return [(client, fl.common.EvaluateIns(parameters, eval_config)) for client in clients]
 
 
-# Define FedProx strategy — requires 2 clients minimum
+# ---------------------------------------------------------------------------
+# Strategy instantiation
+# ---------------------------------------------------------------------------
 strategy = CustomFedProx(
-    min_fit_clients=2,        # Require 2 clients for training
-    min_available_clients=2,  # Need 2 clients to be available
-    min_evaluate_clients=2,   # Evaluate on both clients
-    fraction_fit=1.0,         # Use 100% of available clients for training
-    fraction_evaluate=1.0,    # Evaluate on 100% of available clients
+    min_fit_clients=config.MIN_FIT_CLIENTS,
+    min_available_clients=config.MIN_AVAILABLE_CLIENTS,
+    min_evaluate_clients=config.MIN_EVALUATE_CLIENTS,
+    fraction_fit=config.FRACTION_FIT,
+    fraction_evaluate=config.FRACTION_EVALUATE,
     evaluate_metrics_aggregation_fn=weighted_average,
     on_fit_config_fn=fit_config,
     on_evaluate_config_fn=evaluate_config,
     initial_parameters=fl.common.ndarrays_to_parameters(get_initial_parameters(model)),
-    proximal_mu=0.1,
+    proximal_mu=config.PROXIMAL_MU,
 )
 
 
-class PersistentServer(fl.server.Server):
-    """Flower server that stays alive after all training rounds complete.
-
-    The default Flower server exits once ``num_rounds`` rounds finish. This
-    subclass overrides ``run()`` to keep the process alive, allowing new clients
-    to connect for additional training or evaluation after the initial run.
-
-    Args:
-        *args: Passed through to ``fl.server.Server.__init__``.
-        **kwargs: Passed through to ``fl.server.Server.__init__``.
-
-    Attributes:
-        keep_running (bool): Set to ``False`` externally to shut down the loop.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.keep_running = True
-
-    def run(self, num_rounds: int, timeout: Optional[float]) -> History:
-        """Run all FL rounds then enter an idle keep-alive loop.
-
-        Args:
-            num_rounds (int): Number of FL rounds to execute.
-            timeout (float or None): Per-round timeout in seconds.
-
-        Returns:
-            History: Flower training history containing per-round metrics.
-        """
-        history = super().run(num_rounds, timeout)
-        print("\nTraining completed. Keeping server alive for new connections...")
-        while self.keep_running:
-            time.sleep(1)
-        return history
-
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
 
 def main() -> None:
-    """Entry point: start FastAPI prediction server and Flower FL server.
+    """Start FastAPI prediction server and Flower FL server.
 
     Execution order:
-        1. Create FastAPI app with ``/`` (HTML form) and ``/predict`` endpoints.
-        2. Launch FastAPI + Uvicorn in a background daemon thread on port 5000.
-        3. Start Flower gRPC server on port 8080 for 30 FL rounds.
-        4. Save the final global model to ``global_model_final.pth``.
-        5. Enter infinite keep-alive loop (Ctrl+C to exit).
+        1. Create FastAPI app with ``/``, ``/predict``, ``/health``, ``/metrics``.
+        2. Launch FastAPI + Uvicorn in a background daemon thread on API port.
+        3. Start Flower gRPC server on FL port for NUM_ROUNDS rounds.
+        4. Save final global model to ``global_model_final.pth``.
+        5. Enter keep-alive loop (Ctrl+C to exit).
     """
     import threading
     from fastapi import FastAPI, HTTPException
-    import uvicorn
     from fastapi.staticfiles import StaticFiles
     from fastapi.templating import Jinja2Templates
     from fastapi import Request
+    import uvicorn
 
     app = FastAPI(
         title="Diabetes Risk Prediction API",
-        description="Federated learning-based diabetes risk assessment",
-        version="1.0.0"
+        description=(
+            "Federated learning-based diabetes risk assessment using the "
+            "Pima Indians Diabetes Dataset. Powered by PyTorch + Flower."
+        ),
+        version="2.0.0",
     )
 
-    app.mount("/static", StaticFiles(directory="static"), name="static")
+    # Mount static files if the directory exists
+    if os.path.isdir("static"):
+        app.mount("/static", StaticFiles(directory="static"), name="static")
 
-    import os
     templates = Jinja2Templates(directory="templates")
 
+    # ------------------------------------------------------------------
+    # GET /
+    # ------------------------------------------------------------------
     @app.get("/", summary="Serve the prediction web form")
     async def read_root(request: Request):
-        """Serve the Jinja2 HTML form for manual predictions."""
+        """Serve the Jinja2 HTML form for manual diabetes risk predictions."""
         return templates.TemplateResponse("index.html", {"request": request})
 
-    @app.post("/predict", summary="Predict diabetes risk from patient features")
+    # ------------------------------------------------------------------
+    # POST /predict
+    # ------------------------------------------------------------------
+    @app.post("/predict", summary="Predict diabetes risk from Pima patient features")
     async def predict(data: dict):
         """Accept patient health features and return a diabetes risk assessment.
 
-        The model expects 8 numeric features matching the Pima Indians Diabetes
-        dataset columns. Missing fields default to 0.
+        Expected JSON body keys (all Pima Indians Diabetes Dataset columns):
+            Pregnancies, Glucose, BloodPressure, SkinThickness,
+            Insulin, BMI, DiabetesPedigreeFunction, Age
 
-        Args:
-            data (dict): JSON body with keys: ``Pregnancies``, ``Glucose``,
-                ``BloodPressure``, ``SkinThickness``, ``Insulin``, ``BMI``,
-                ``DiabetesPedigreeFunction``, ``Age``.
+        Missing fields default to 0.
 
         Returns:
-            dict: ``status``, ``risk_percentage``, ``risk_level``,
-                ``interpretation``, ``recommendation``.
+            JSON with: status, risk_percentage, risk_level, interpretation, recommendation.
 
         Raises:
-            HTTPException: 500 if model inference fails.
+            HTTPException 500: if model inference fails.
         """
         try:
             input_features = [
-                float(data.get('Pregnancies', 0)),
-                float(data.get('Glucose', 0)),
-                float(data.get('BloodPressure', 0)),
-                float(data.get('SkinThickness', 0)),
-                float(data.get('Insulin', 0)),
-                float(data.get('BMI', 0)),
-                float(data.get('DiabetesPedigreeFunction', 0)),
-                float(data.get('Age', 0))
+                float(data.get("Pregnancies", 0)),
+                float(data.get("Glucose", 0)),
+                float(data.get("BloodPressure", 0)),
+                float(data.get("SkinThickness", 0)),
+                float(data.get("Insulin", 0)),
+                float(data.get("BMI", 0)),
+                float(data.get("DiabetesPedigreeFunction", 0)),
+                float(data.get("Age", 0)),
             ]
 
             model.eval()
@@ -455,19 +460,28 @@ def main() -> None:
                 probabilities = torch.softmax(output, dim=1)
                 risk_percentage = round(probabilities[0][1].item() * 100, 2)
 
-                logger.info(f"Model output: {output}")
-                logger.info(f"Probabilities: {probabilities}")
-                logger.info(f"Risk percentage: {risk_percentage}%")
+            logger.debug("Model output: %s", output)
+            logger.debug("Probabilities: %s", probabilities)
+            logger.info("Prediction: risk=%.2f%%", risk_percentage)
 
-            if risk_percentage < 25:
+            if risk_percentage < config.LOW_RISK_THRESHOLD:
                 risk_level = "Low"
-                recommendation = "Maintain a healthy lifestyle with regular exercise and balanced diet."
-            elif risk_percentage < 75:
+                recommendation = (
+                    "Maintain a healthy lifestyle with regular exercise and a balanced diet. "
+                    "Annual check-ups are recommended."
+                )
+            elif risk_percentage < config.HIGH_RISK_THRESHOLD:
                 risk_level = "Moderate"
-                recommendation = "Consider lifestyle changes and regular monitoring. Consult a healthcare provider."
+                recommendation = (
+                    "Consider lifestyle changes and regular blood glucose monitoring. "
+                    "Consult a healthcare provider for personalised advice."
+                )
             else:
                 risk_level = "High"
-                recommendation = "Please consult with an endocrinologist for a comprehensive evaluation and management plan."
+                recommendation = (
+                    "Please consult an endocrinologist for a comprehensive evaluation "
+                    "and diabetes management plan."
+                )
 
             return {
                 "status": "success",
@@ -475,60 +489,94 @@ def main() -> None:
                 "risk_level": risk_level,
                 "interpretation": (
                     f"Based on the provided health data, the patient has a {risk_percentage}% "
-                    f"risk of developing diabetes. This is considered {risk_level} risk."
+                    f"probability of having diabetes. This is considered {risk_level} risk."
                 ),
-                "recommendation": recommendation
+                "recommendation": recommendation,
             }
 
         except Exception as e:
+            logger.exception("Prediction error")
             raise HTTPException(status_code=500, detail=str(e))
 
+    # ------------------------------------------------------------------
+    # GET /health
+    # ------------------------------------------------------------------
+    @app.get("/health", summary="Server and training status")
+    async def health():
+        """Return the current server and FL training status.
+
+        Returns:
+            JSON with: status, current_round, total_rounds, training_complete,
+            best_accuracy, uptime_seconds.
+        """
+        return {
+            "status": "ok",
+            "current_round": _training_state["current_round"],
+            "total_rounds": _training_state["total_rounds"],
+            "training_complete": _training_state["training_complete"],
+            "best_accuracy": round(_training_state["best_accuracy"], 4),
+        }
+
+    # ------------------------------------------------------------------
+    # GET /metrics
+    # ------------------------------------------------------------------
+    @app.get("/metrics", summary="Latest per-round training metrics")
+    async def metrics():
+        """Return aggregated metrics from the most recent completed FL round.
+
+        Returns:
+            JSON with: latest_round metrics and full training history list.
+        """
+        return {
+            "latest": _training_state["latest_metrics"],
+            "history": _training_state["history"],
+        }
+
+    # ------------------------------------------------------------------
+    # Start FastAPI in daemon thread
+    # ------------------------------------------------------------------
     def run_fastapi():
-        """Run Uvicorn in a daemon thread (non-blocking)."""
-        uvicorn.run(app, host="0.0.0.0", port=5000)
+        uvicorn.run(app, host="0.0.0.0", port=config.SERVER_API_PORT)
 
     fastapi_thread = threading.Thread(target=run_fastapi, daemon=True)
     fastapi_thread.start()
 
-    server_ip = '0.0.0.0'
     machine_ip = socket.gethostbyname(socket.gethostname())
 
-    print("\n" + "="*50)
-    print("Starting Diabetes Prediction Server")
-    print("="*50)
-    print(f"Flower server binding to: {server_ip}:8080")
-    print(f"Machine IP Address: {machine_ip}")
-    print(f"FastAPI server running on: http://{server_ip}:5000")
-    print(f"\nClients should connect to: {machine_ip}:8080")
-    print("\nServer is running. Will work with 1 or 2 clients...")
-    print("="*50)
+    print("\n" + "=" * 55)
+    print("  🫀 Diabetes Risk Prediction — FL Server")
+    print("=" * 55)
+    print(f"  Flower gRPC : 0.0.0.0:{config.SERVER_FL_PORT}")
+    print(f"  FastAPI     : http://0.0.0.0:{config.SERVER_API_PORT}")
+    print(f"  Machine IP  : {machine_ip}")
+    print(f"  Rounds      : {config.NUM_ROUNDS}")
+    print(f"  Min clients : {config.MIN_FIT_CLIENTS}")
+    print(f"  Clients connect to → {machine_ip}:{config.SERVER_FL_PORT}")
+    print("=" * 55 + "\n")
 
     try:
         history = fl.server.start_server(
-            server_address=f"{server_ip}:8080",
+            server_address=f"0.0.0.0:{config.SERVER_FL_PORT}",
             config=fl.server.ServerConfig(
-                num_rounds=30,
-                round_timeout=120,
+                num_rounds=config.NUM_ROUNDS,
+                round_timeout=config.ROUND_TIMEOUT,
             ),
-            strategy=strategy
+            strategy=strategy,
         )
 
-        torch.save(model.state_dict(), 'global_model_final.pth')
-        print("\nFinal global model saved to global_model_final.pth")
+        _training_state["training_complete"] = True
 
-        print("\n" + "="*50)
-        print("Training completed! Starting server test...")
-        print("="*50)
+        torch.save(model.state_dict(), config.FINAL_MODEL_PATH)
+        logger.info("Final global model saved → %s", config.FINAL_MODEL_PATH)
 
-        import subprocess
-        import sys
-        python = sys.executable
-        subprocess.Popen([python, "test_server.py"])
-
-        print("\nServer is running and ready for predictions.")
-        print("Press Ctrl+C to stop the server.")
-        print("Test the prediction endpoint with: python test_predict.py")
-        print("="*50 + "\n")
+        print("\n" + "=" * 55)
+        print("  ✅ Training complete!")
+        print(f"  Best accuracy : {_training_state['best_accuracy']:.4f}")
+        print(f"  Final model   : {config.FINAL_MODEL_PATH}")
+        print(f"  History       : {config.TRAINING_HISTORY_PATH}")
+        print(f"  API running   : http://{machine_ip}:{config.SERVER_API_PORT}/predict")
+        print("  Press Ctrl+C to stop.")
+        print("=" * 55 + "\n")
 
         while True:
             time.sleep(1)

@@ -1,4 +1,4 @@
-# 🫀 Federated Learning for Heart Disease Prediction
+# 🩺 Federated Learning for Diabetes Risk Prediction
 
 ![Python](https://img.shields.io/badge/Python-3.7%2B-blue?logo=python&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/PyTorch-1.9%2B-EE4C2C?logo=pytorch&logoColor=white)
@@ -7,7 +7,9 @@
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 ![Status](https://img.shields.io/badge/Status-Active-brightgreen)
 
-A **privacy-preserving machine learning system** that predicts heart disease / diabetes risk using federated learning. Multiple hospitals or clinics can collaboratively train a shared model **without ever sharing raw patient data** — each institution keeps its data local.
+A **privacy-preserving machine learning system** that predicts **diabetes risk** using federated learning. Multiple hospitals or clinics can collaboratively train a shared model **without ever sharing raw patient data** — each institution keeps its data local.
+
+> **Dataset:** Pima Indians Diabetes Dataset — 8 clinical features including Glucose, BMI, Insulin, and Age.
 
 ---
 
@@ -30,15 +32,15 @@ A **privacy-preserving machine learning system** that predicts heart disease / d
 
 ## 🔍 Overview
 
-Traditional machine learning requires centralizing all patient data on one server — a massive privacy risk in healthcare. This project uses **Federated Learning (FL)** to solve that problem:
+Traditional machine learning requires centralising all patient data on one server — a massive privacy risk in healthcare. This project uses **Federated Learning (FL)** to solve that problem:
 
 1. A central **server** coordinates training and holds the global model
-2. Multiple **clients** (hospitals/clinics) each train on their local data
+2. Multiple **clients** (hospitals/clinics) each train on their local diabetes data
 3. Only **model weights** (never raw data) are sent to the server
 4. The server **aggregates** the weights using the **FedProx** algorithm
 5. The improved global model is sent back to all clients
 
-After training, the server exposes a **FastAPI REST endpoint** for real-time diabetes risk predictions.
+After training, the server exposes a **FastAPI REST API** for real-time diabetes risk predictions.
 
 ---
 
@@ -52,10 +54,10 @@ After training, the server exposes a **FastAPI REST endpoint** for real-time dia
 │  │  CLIENT 1   │         │         SERVER             │  │
 │  │  Hospital A │◄───────►│  • FedProx Aggregation     │  │
 │  │  (local DB) │         │  • Global DiabetesModel    │  │
-│  └─────────────┘         │  • FastAPI /predict        │  │
-│                          │    (port 5000)              │  │
-│  ┌─────────────┐         │  • Flower gRPC             │  │
-│  │  CLIENT 2   │◄───────►│    (port 8080)             │  │
+│  └─────────────┘         │  • POST /predict           │  │
+│                          │  • GET  /health            │  │
+│  ┌─────────────┐         │  • GET  /metrics           │  │
+│  │  CLIENT 2   │◄───────►│  • Flower gRPC :8080       │  │
 │  │  Hospital B │         └────────────────────────────┘  │
 │  │  (local DB) │                                         │
 │  └─────────────┘                                         │
@@ -67,7 +69,7 @@ After training, the server exposes a **FastAPI REST endpoint** for real-time dia
 ### Model Architecture — `DiabetesModel`
 
 ```
-Input (8 features)
+Input (8 features: Pregnancies, Glucose, BP, SkinThickness, Insulin, BMI, DPF, Age)
     │
     ▼
 Linear(8→32) → LeakyReLU → BatchNorm → Dropout(0.5)
@@ -79,10 +81,11 @@ Linear(32→16) → LeakyReLU → BatchNorm → Dropout(0.4)
 Linear(16→8)  → LeakyReLU → BatchNorm → Dropout(0.3)
     │
     ▼
-Linear(8→2)  ← output logits (No Disease / Disease)
+Linear(8→2)  ← logits: [No Diabetes, Diabetes]
+    │
+    ▼
+Softmax → risk probability %
 ```
-
-Weights are initialised with **Kaiming Normal** (suitable for LeakyReLU activations).
 
 ---
 
@@ -91,41 +94,38 @@ Weights are initialised with **Kaiming Normal** (suitable for LeakyReLU activati
 | Feature | Details |
 |---|---|
 | 🔒 **Privacy-Preserving** | Raw patient data never leaves the local machine |
-| 🧠 **FedProx Strategy** | Handles non-IID data distributions across clients |
-| 🌐 **REST API** | FastAPI endpoint for real-time predictions |
-| 📊 **Rich Metrics** | Accuracy, Precision, Recall, F1-score per round |
+| 🧠 **FedProx Strategy** | Handles non-IID data distributions across hospitals |
+| 🌐 **REST API** | FastAPI endpoints for predictions, health checks, and metrics |
+| 📊 **Rich Metrics** | Accuracy, Precision, Recall, F1-score per FL round |
+| 💾 **Model Checkpointing** | Best model saved automatically each round |
+| 📈 **Training History** | Per-round metrics persisted to `training_history.json` |
 | ⚡ **Early Stopping** | Prevents client overfitting during local training |
 | 🔁 **LR Scheduling** | ReduceLROnPlateau adapts learning rate automatically |
-| 🏥 **Multi-Client** | Supports 2+ hospital/clinic clients simultaneously |
-| 💾 **Model Checkpointing** | Best global model saved after training completes |
+| ⚙️ **Centralised Config** | All hyperparameters in one `config.py` file |
+| 🌍 **Env Var Support** | Override server IP, ports, and rounds via env vars |
 
 ---
 
 ## 📁 Project Structure
 
 ```
-Federated-Learning-for-Heart-Disease-Prediction/
+Federated-Learning-Project/
 │
-├── server.py                    # Flower FL server + FastAPI prediction API
-├── client.py                    # Flower FL client with local training logic
-├── fixed_server.py              # Bug-fixed server variant
-├── fixed_client.py              # Bug-fixed client variant
-├── improved_server.py           # Performance-improved server
-├── improved_client.py           # Performance-improved client
-├── tuned_client.py              # Hyperparameter-tuned client
-├── network_utils.py             # Network scanning and IP utilities
-├── setup_scaler.py              # Pre-compute and save the global scaler
-├── analyze_class_imbalance.py   # Dataset class imbalance analysis
+├── server.py                    # FL server + FastAPI prediction API
+├── client.py                    # FL client with local training logic
+├── config.py                    # ⭐ Centralised configuration (all hyperparameters)
+├── network_utils.py             # Network scanning and IP discovery
+├── setup_scaler.py              # Pre-compute and save the global StandardScaler
+├── analyze_class_imbalance.py   # Dataset class imbalance analysis tool
 ├── check_network.py             # Network connectivity checker
 │
 ├── test_server.py               # Manual server integration test
-├── test_predict.py              # Manual prediction endpoint test
-├── fixed_test_server.py         # Test for fixed server
+├── test_predict.py              # Manual /predict endpoint test
 ├── final_audit.py               # Full system audit script
 │
-├── global_model_final.pth       # Saved global model (post-training)
-├── fixed_global_model.pth       # Saved fixed-variant model
-├── improved_global_model.pth    # Saved improved-variant model
+├── checkpoints/                 # Per-round model checkpoints (auto-created)
+├── training_history.json        # Per-round metrics log (auto-created)
+├── global_model_final.pth       # Final saved model (post-training)
 ├── global_scaler.pkl            # Saved StandardScaler for inference
 │
 ├── frontend/                    # React frontend for the prediction UI
@@ -153,7 +153,7 @@ Federated-Learning-for-Heart-Disease-Prediction/
 
 - **Python 3.7+**
 - **pip** (Python package manager)
-- Two machines (or two terminal windows on one machine) for client-server setup
+- Two machines (or two terminal windows) for client-server deployment
 
 ---
 
@@ -169,13 +169,12 @@ cd Federated-Learning-Project
 ### 2. Create and activate a virtual environment
 
 ```bash
-# Create virtual environment
+# Windows
 python -m venv fl_env
-
-# Activate on Windows
 fl_env\Scripts\activate
 
-# Activate on macOS/Linux
+# macOS / Linux
+python -m venv fl_env
 source fl_env/bin/activate
 ```
 
@@ -189,141 +188,171 @@ pip install -r requirements.txt
 
 ## 📊 Dataset
 
-The model expects **CSV files** with the following 8 feature columns (Pima Indians Diabetes dataset format):
+The model uses the **Pima Indians Diabetes Dataset** — a classic benchmark for binary diabetes classification.
 
-| Column | Description | Unit |
+| Feature | Description | Unit |
 |---|---|---|
 | `Pregnancies` | Number of pregnancies | count |
-| `Glucose` | Plasma glucose concentration | mg/dL |
+| `Glucose` | Plasma glucose concentration (2-hour OGTT) | mg/dL |
 | `BloodPressure` | Diastolic blood pressure | mm Hg |
 | `SkinThickness` | Triceps skinfold thickness | mm |
 | `Insulin` | 2-Hour serum insulin | μU/mL |
 | `BMI` | Body mass index | kg/m² |
-| `DiabetesPedigreeFunction` | Diabetes pedigree function | score |
+| `DiabetesPedigreeFunction` | Genetic diabetes risk score | score |
 | `Age` | Age | years |
-| `Outcome` | Target variable (0 = No Diabetes, 1 = Diabetes) | binary |
+| `Outcome` | **Target** — 0 = No Diabetes, 1 = Diabetes | binary |
 
-**Client dataset files (place in project root):**
-- `diabetes_non_negative_part1_2000.csv` → used by Client 1
-- `diabetes_non_negative_part2_2000.csv` → used by Client 2
+**Expected dataset files (place in project root):**
+- `diabetes_non_negative_part1_2000.csv` → Client 1
+- `diabetes_non_negative_part2_2000.csv` → Client 2
 
 ---
 
 ## ⚙️ Configuration
 
-### Server IP (client.py)
+All settings live in [`config.py`](config.py). Environment variables override defaults:
 
-Before running on multiple machines, update the server IP at the top of `client.py`:
+```bash
+# Override server IP for multi-machine deployment
+FL_SERVER_IP=192.168.1.100 python client.py --client-id 1
 
-```python
-# client.py — line 25
-SERVER_IP = "192.168.1.100"   # ← Replace with your server's actual IP
+# Override FL rounds
+FL_NUM_ROUNDS=50 python server.py
 ```
 
-### Key Parameters
-
-| Parameter | Default | Description |
-|---|---|---|
-| `num_rounds` | `30` | Number of federated learning rounds |
-| `round_timeout` | `120s` | Timeout per round |
-| `proximal_mu` | `0.1` | FedProx proximal term weight |
-| `min_fit_clients` | `2` | Minimum clients needed to start a round |
-| `learning_rate` | `0.0017` | Adam optimizer learning rate |
-| `batch_size` | `32` | Training batch size per client |
-| FL port | `8080` | Flower gRPC port |
-| API port | `5000` | FastAPI prediction endpoint port |
+| Parameter | Default | Env Var | Description |
+|---|---|---|---|
+| `SERVER_IP` | `10.133.98.49` | `FL_SERVER_IP` | Server machine's LAN IP |
+| `SERVER_FL_PORT` | `8080` | `FL_SERVER_PORT` | Flower gRPC port |
+| `SERVER_API_PORT` | `5000` | `FL_API_PORT` | FastAPI port |
+| `NUM_ROUNDS` | `30` | `FL_NUM_ROUNDS` | FL training rounds |
+| `PROXIMAL_MU` | `0.1` | — | FedProx μ coefficient |
+| `LEARNING_RATE` | `0.0017` | — | Adam LR |
+| `BATCH_SIZE` | `32` | — | Mini-batch size |
+| `LOCAL_EPOCHS` | `1` | — | Local epochs per round |
 
 ---
 
 ## 🏃 Running the Project
 
-### Single Machine (development)
+### Single Machine (Development / Demo)
 
 Open **three** terminal windows:
 
-**Terminal 1 — Start the server:**
+**Terminal 1 — Server:**
 ```bash
 python server.py
 ```
 
-**Terminal 2 — Start client 1:**
+**Terminal 2 — Client 1:**
 ```bash
 python client.py --client-id 1
 ```
 
-**Terminal 3 — Start client 2:**
+**Terminal 3 — Client 2:**
 ```bash
 python client.py --client-id 2
 ```
 
-### Multi-Machine (network deployment)
-
-1. Set `SERVER_IP` in `client.py` to the server's actual LAN IP
-2. Run `python server.py` on the server machine
-3. Run `python client.py --client-id 1` on each client machine
-
-### Client Options
+### Multi-Machine (Network Deployment)
 
 ```bash
+# Set server IP via environment variable — no code changes needed
+FL_SERVER_IP=192.168.1.50 python client.py --client-id 1
+FL_SERVER_IP=192.168.1.50 python client.py --client-id 2
+```
+
+### Client CLI Options
+
+```
 python client.py --help
 
-Options:
-  --server-address TEXT   Server address host:port  [default: SERVER_IP:8080]
-  --client-id INTEGER     Unique client identifier  [required]
-  --batch-size INTEGER    Training batch size        [default: 32]
+  --server-address TEXT   Server address host:port  [default: configured IP:8080]
+  --client-id INTEGER     Unique client ID (1 or 2)  [required]
+  --batch-size INTEGER    Training batch size         [default: 32]
 ```
 
 ---
 
 ## 🌐 API Reference
 
-After training completes, the server exposes a prediction endpoint:
+After training starts, the FastAPI server is immediately available at `http://localhost:5000`.
 
-### `POST /predict`
+### `POST /predict` — Diabetes Risk Prediction
 
-**Request body:**
-
+**Request:**
 ```json
 {
-  "Pregnancies": 2,
-  "Glucose": 120,
-  "BloodPressure": 70,
-  "SkinThickness": 25,
-  "Insulin": 85,
-  "BMI": 28.5,
-  "DiabetesPedigreeFunction": 0.45,
-  "Age": 35
+  "Pregnancies": 6,
+  "Glucose": 148,
+  "BloodPressure": 72,
+  "SkinThickness": 35,
+  "Insulin": 0,
+  "BMI": 33.6,
+  "DiabetesPedigreeFunction": 0.627,
+  "Age": 50
 }
 ```
 
 **Response:**
-
 ```json
 {
   "status": "success",
-  "risk_percentage": "34.72%",
-  "risk_level": "Moderate",
-  "interpretation": "Based on the provided health data, the patient has a 34.72% risk of developing diabetes. This is considered Moderate risk.",
-  "recommendation": "Consider lifestyle changes and regular monitoring. Consult a healthcare provider."
+  "risk_percentage": "78.43%",
+  "risk_level": "High",
+  "interpretation": "Based on the provided health data, the patient has a 78.43% probability of having diabetes. This is considered High risk.",
+  "recommendation": "Please consult an endocrinologist for a comprehensive evaluation and diabetes management plan."
 }
 ```
 
 **Risk Levels:**
 
-| Risk % | Level | Recommendation |
+| Risk % | Level | Action |
 |---|---|---|
 | < 25% | 🟢 Low | Maintain healthy lifestyle |
 | 25–75% | 🟡 Moderate | Lifestyle changes + monitoring |
-| > 75% | 🔴 High | Consult an endocrinologist |
+| > 75% | 🔴 High | Consult endocrinologist |
 
-### Test the API manually:
+---
+
+### `GET /health` — Server Status
+
+```json
+{
+  "status": "ok",
+  "current_round": 15,
+  "total_rounds": 30,
+  "training_complete": false,
+  "best_accuracy": 0.7812
+}
+```
+
+### `GET /metrics` — Training Metrics
+
+```json
+{
+  "latest": { "round": 15, "accuracy": 0.7812 },
+  "history": [
+    { "round": 1, "accuracy": 0.6543 },
+    { "round": 2, "accuracy": 0.6901 },
+    ...
+  ]
+}
+```
+
+### Test the API
 
 ```bash
+# Manual test with correct diabetes features
 python test_predict.py
-# or
+
+# Against a remote server
+python test_predict.py --server http://192.168.1.100:5000
+
+# curl example
 curl -X POST http://localhost:5000/predict \
   -H "Content-Type: application/json" \
-  -d '{"Pregnancies":2,"Glucose":120,"BloodPressure":70,"SkinThickness":25,"Insulin":85,"BMI":28.5,"DiabetesPedigreeFunction":0.45,"Age":35}'
+  -d '{"Pregnancies":6,"Glucose":148,"BloodPressure":72,"SkinThickness":35,"Insulin":0,"BMI":33.6,"DiabetesPedigreeFunction":0.627,"Age":50}'
 ```
 
 ---
@@ -336,21 +365,19 @@ Run the full test suite (no real server or dataset needed):
 pytest tests/ -v
 ```
 
-Run with coverage report:
+With coverage:
 
 ```bash
 pytest tests/ -v --cov=. --cov-report=term-missing
 ```
 
-Test categories:
-
 | Test File | Coverage |
 |---|---|
-| `test_model.py` | Forward pass, output shape, weight init, dropout |
-| `test_data_loading.py` | CSV loading, 80/20 split, normalization, edge cases |
-| `test_network_utils.py` | IP detection, address format validation |
+| `test_model.py` | Forward pass, output shape, weight init, dropout mode |
+| `test_data_loading.py` | CSV loading, split ratio, normalization, edge cases |
+| `test_network_utils.py` | IP detection, ping mocking |
 | `test_server_utils.py` | Weighted average, config helpers, parameter extraction |
-| `test_flower_client.py` | get/set parameters, fit/evaluate output format |
+| `test_flower_client.py` | get/set params roundtrip, evaluate/fit output format |
 
 ---
 
@@ -358,7 +385,7 @@ Test categories:
 
 1. Fork the repository
 2. Create a feature branch: `git checkout -b feature/your-feature`
-3. Commit your changes: `git commit -m "Add your feature"`
+3. Commit your changes: `git commit -m "feat: add your feature"`
 4. Push the branch: `git push origin feature/your-feature`
 5. Open a Pull Request
 
@@ -366,7 +393,7 @@ Test categories:
 
 ## 📄 License
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+This project is licensed under the MIT License.
 
 ---
 

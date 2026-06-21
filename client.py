@@ -1,78 +1,66 @@
 """
-client.py — Federated Learning Client for Heart Disease / Diabetes Prediction
-==============================================================================
+client.py — Federated Learning Client for Diabetes Risk Prediction
+==================================================================
 
-This module implements the Flower (flwr) federated learning client. Each client
-represents a hospital or clinic with its own local patient dataset.
-
-Responsibilities:
-    - Load and preprocess a local CSV dataset (Pima Indians Diabetes format).
-    - Define the ``DiabetesModel`` neural network (identical to the server model).
-    - Implement ``FlowerClient`` which performs local training and evaluation.
-    - Connect to the central Flower server and participate in FL rounds.
+Implements the Flower (flwr) federated learning client. Each client represents
+a hospital or clinic with its own local patient dataset (Pima Indians Diabetes).
 
 Usage::
 
     python client.py --client-id 1 [--server-address HOST:PORT] [--batch-size N]
 
-Client IDs determine which dataset partition is loaded:
-    - Client 1 → ``diabetes_non_negative_part1_2000.csv``
-    - Client 2 → ``diabetes_non_negative_part2_2000.csv``
-    - Other IDs → defaults to part 1
+Environment variables (override config.py defaults)::
 
-Notes:
-    - Update ``SERVER_IP`` at the top of this file before running on a network.
-    - No raw data ever leaves this machine — only model weights are transmitted.
+    FL_SERVER_IP=192.168.1.100 python client.py --client-id 1
 
 See Also:
     server.py      — FL server and prediction API
-    docs/architecture.md — In-depth architecture documentation
+    config.py      — All hyperparameters and paths
 """
 
-# client.py
+import os
+import sys
+import argparse
+import logging
+import socket
+import time
+from typing import Dict, List, Tuple, Optional
+from collections import OrderedDict
+
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torch.utils.data as data
+import flwr as fl
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import precision_score, recall_score, f1_score
-import pandas as pd
-import flwr as fl
-from typing import Dict, List, Tuple, Optional
-from collections import OrderedDict
-import logging
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
-import threading
-import time
-import sys
-import argparse
-import socket
-import torch.utils.data as data
+
+import config
 
 # ---------------------------------------------------------------------------
-# Server IP Configuration — UPDATE THIS BEFORE NETWORK DEPLOYMENT
+# Logging
 # ---------------------------------------------------------------------------
-SERVER_IP = "10.133.98.49"  # Replace with your server machine's actual LAN IP
-
-# Configure logging to both console and a rotating log file
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("client.log")
-    ]
+        logging.FileHandler(config.CLIENT_LOG_PATH),
+    ],
 )
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI (used by the client-side prediction micro-service if needed)
+# ---------------------------------------------------------------------------
+# FastAPI app (client-side micro-service)
+# ---------------------------------------------------------------------------
 app = FastAPI()
-
-# Enable CORS so the React frontend can make cross-origin requests
-from fastapi.middleware.cors import CORSMiddleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://10.26.65.217:3000"],
@@ -82,147 +70,128 @@ app.add_middleware(
 )
 
 
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+
 def load_diabetes_data(
-    file_path: str = 'diabetes_non_negative_part1_2000.csv',
-    test_size: float = 0.2
+    file_path: str = config.DATASET_CLIENT_1,
+    test_size: float = config.TEST_SIZE,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Load, validate, and preprocess the Pima Indians Diabetes CSV dataset.
 
-    Steps performed:
-        1. Read CSV with ``pandas``.
-        2. Extract the 8 standard feature columns (or fall back to first 8 cols).
-        3. Extract the ``Outcome`` target column (or last column as fallback).
-        4. Convert multi-class targets to binary (disease / no disease).
-        5. Stratified 80/20 train/test split (``random_state=42``).
-        6. Standardise features with ``StandardScaler`` (fit on train, transform both).
-        7. Convert arrays to ``torch.FloatTensor`` / ``torch.LongTensor``.
+    Steps:
+        1. Read CSV with pandas.
+        2. Extract 8 feature columns (or fall back to first 8 columns).
+        3. Extract ``Outcome`` column (or last column as fallback).
+        4. Binarise multi-class targets.
+        5. Stratified 80/20 train/test split (seed=42).
+        6. Fit ``StandardScaler`` on train, transform both splits.
+        7. Convert to ``torch.FloatTensor`` / ``torch.LongTensor``.
 
     Args:
-        file_path (str): Path to the CSV file. Must contain the 8 feature columns
-            or at least 9 columns total. Default: ``diabetes_non_negative_part1_2000.csv``.
-        test_size (float): Fraction of samples reserved for the test set.
-            Must be between 0 and 1. Default: ``0.2`` (20 % test).
+        file_path: Path to the CSV file.
+        test_size: Fraction reserved for the test set (default 0.2).
 
     Returns:
-        tuple: ``(X_train, X_test, y_train, y_test)`` — four tensors:
-            - ``X_train`` (FloatTensor): Training features, shape ``(n_train, 8)``.
-            - ``X_test``  (FloatTensor): Test features,     shape ``(n_test,  8)``.
-            - ``y_train`` (LongTensor):  Training labels,   shape ``(n_train,)``.
-            - ``y_test``  (LongTensor):  Test labels,       shape ``(n_test,)``.
+        Tuple ``(X_train, X_test, y_train, y_test)`` as PyTorch tensors.
 
     Raises:
         ValueError: If the CSV file is empty.
         FileNotFoundError: If ``file_path`` does not exist.
-
-    Example::
-
-        X_train, X_test, y_train, y_test = load_diabetes_data("data.csv", test_size=0.2)
-        print(X_train.shape)  # torch.Size([1600, 8])
     """
     try:
         df = pd.read_csv(file_path)
 
         if df.empty:
-            raise ValueError("The dataset is empty. Please check the file path.")
+            raise ValueError(f"Dataset at '{file_path}' is empty.")
 
-        logger.info(f"Dataset shape: {df.shape}")
-        logger.info("\nDataset info:")
-        logger.info(df.info())
-        logger.info("\nFirst few rows of the dataset:")
-        logger.info(df.head())
+        logger.info("Dataset loaded: shape=%s", df.shape)
 
-        feature_columns = [
-            'Pregnancies', 'Glucose', 'BloodPressure', 'SkinThickness',
-            'Insulin', 'BMI', 'DiabetesPedigreeFunction', 'Age'
-        ]
-
-        missing_features = [f for f in feature_columns if f not in df.columns]
-        if missing_features:
-            logger.warning(f"Warning: Missing expected features: {missing_features}")
-            logger.warning("Using first 8 columns as features")
+        # Extract features
+        missing = [c for c in config.FEATURE_COLUMNS if c not in df.columns]
+        if missing:
+            logger.warning("Missing expected columns %s — using first 8 columns.", missing)
             X = df.iloc[:, :8].values
         else:
-            X = df[feature_columns].values
+            X = df[config.FEATURE_COLUMNS].values
 
-        if 'Outcome' in df.columns:
-            y = df['Outcome'].values
+        # Extract target
+        if config.TARGET_COLUMN in df.columns:
+            y = df[config.TARGET_COLUMN].values
         else:
             y = df.iloc[:, -1].values
 
-        logger.info(f"Loaded {X.shape[1]} features and {y.shape[0]} samples")
+        logger.info("Features: %d | Samples: %d", X.shape[1], y.shape[0])
 
-        # Binarise target if more than 2 unique values exist
+        # Binarise multi-class targets
         if len(np.unique(y)) > 2:
             y = (y > 0).astype(int)
 
     except Exception as e:
-        logger.error(f"Error loading the dataset: {e}")
+        logger.error("Error loading dataset: %s", e)
         raise
 
-    # Stratified split preserves class balance in train and test sets
+    # Stratified split
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=42, stratify=y
     )
 
-    # Fit scaler on training data only to prevent data leakage
+    # Standardise (fit on train only to prevent data leakage)
     scaler = StandardScaler()
     X_train = scaler.fit_transform(X_train)
     X_test = scaler.transform(X_test)
 
-    # Convert to PyTorch tensors
-    X_train = torch.FloatTensor(X_train)
-    X_test = torch.FloatTensor(X_test)
-    y_train = torch.LongTensor(y_train)
-    y_test = torch.LongTensor(y_test)
+    return (
+        torch.FloatTensor(X_train),
+        torch.FloatTensor(X_test),
+        torch.LongTensor(y_train),
+        torch.LongTensor(y_test),
+    )
 
-    return X_train, X_test, y_train, y_test
 
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
 
 class DiabetesModel(nn.Module):
-    """Feed-forward neural network for binary diabetes / heart disease classification.
+    """Feed-forward neural network for binary diabetes risk classification.
 
-    This is the **same architecture** as the server-side model, ensuring that
-    weight tensors are compatible when the server sends global parameters to clients.
-
-    Architecture:
-        - Layer 1: Linear(input_size → 32) + LeakyReLU + BatchNorm + Dropout(0.5)
-        - Layer 2: Linear(32 → 16)         + LeakyReLU + BatchNorm + Dropout(0.4)
-        - Layer 3: Linear(16 → 8)          + LeakyReLU + BatchNorm + Dropout(0.3)
-        - Output:  Linear(8 → num_classes)
+    Identical architecture to the server-side model to ensure weight compatibility.
 
     Args:
-        input_size (int): Number of input features. Default is 8.
-        num_classes (int): Number of output classes. Default is 2 (binary).
+        input_size: Number of input features. Default: 8.
+        num_classes: Number of output classes. Default: 2.
     """
 
-    def __init__(self, input_size: int = 8, num_classes: int = 2):
-        super(DiabetesModel, self).__init__()
+    def __init__(self, input_size: int = config.INPUT_SIZE, num_classes: int = config.NUM_CLASSES):
+        super().__init__()
         self.layer1 = nn.Sequential(
             nn.Linear(input_size, 32),
-            nn.LeakyReLU(0.1),
+            nn.LeakyReLU(config.LEAKY_RELU_SLOPE),
             nn.BatchNorm1d(32),
-            nn.Dropout(0.5)
+            nn.Dropout(config.DROPOUT_L1),
         )
         self.layer2 = nn.Sequential(
             nn.Linear(32, 16),
-            nn.LeakyReLU(0.1),
+            nn.LeakyReLU(config.LEAKY_RELU_SLOPE),
             nn.BatchNorm1d(16),
-            nn.Dropout(0.4)
+            nn.Dropout(config.DROPOUT_L2),
         )
         self.layer3 = nn.Sequential(
             nn.Linear(16, 8),
-            nn.LeakyReLU(0.1),
+            nn.LeakyReLU(config.LEAKY_RELU_SLOPE),
             nn.BatchNorm1d(8),
-            nn.Dropout(0.3)
+            nn.Dropout(config.DROPOUT_L3),
         )
         self.output = nn.Linear(8, num_classes)
         self._init_weights()
 
     def _init_weights(self) -> None:
-        """Initialise weights with Kaiming Normal; BatchNorm with identity."""
+        """Kaiming Normal init for Linear; identity init for BatchNorm."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="leaky_relu")
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.BatchNorm1d):
@@ -230,13 +199,13 @@ class DiabetesModel(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass, handles single-sample 1-D input automatically.
+        """Forward pass. Auto-unsqueezes 1-D single-sample input.
 
         Args:
-            x (torch.Tensor): Shape ``(batch_size, input_size)`` or ``(input_size,)``.
+            x: Shape ``(batch_size, input_size)`` or ``(input_size,)``.
 
         Returns:
-            torch.Tensor: Raw logits, shape ``(batch_size, num_classes)``.
+            Raw logits, shape ``(batch_size, num_classes)``.
         """
         if x.dim() == 1:
             x = x.unsqueeze(0)
@@ -246,25 +215,20 @@ class DiabetesModel(nn.Module):
         return self.output(x)
 
 
+# ---------------------------------------------------------------------------
+# Flower Client
+# ---------------------------------------------------------------------------
+
 class FlowerClient(fl.client.NumPyClient):
-    """Flower federated learning client for local model training and evaluation.
+    """Flower FL client for local diabetes model training and evaluation.
 
-    Implements the ``fl.client.NumPyClient`` interface so Flower can orchestrate
-    training across multiple clients. The client communicates only model weights
-    (numpy arrays) with the server — raw data never leaves this machine.
-
-    Training details:
-        - Optimizer: Adam with weight decay (L2 regularisation).
-        - Loss: CrossEntropyLoss + optional label smoothing + FedProx proximal term.
-        - LR Scheduler: ReduceLROnPlateau (halves LR after 2 non-improving epochs).
-        - Early Stopping: stops local training after 3 non-improving validation epochs.
+    Communicates only model weight arrays with the server — raw patient
+    data never leaves this machine.
 
     Args:
-        model (DiabetesModel): Local model instance to train.
-        X_train (torch.Tensor): Training features, shape ``(n_train, n_features)``.
-        y_train (torch.Tensor): Training labels,   shape ``(n_train,)``.
-        X_test  (torch.Tensor): Validation/test features, shape ``(n_test, n_features)``.
-        y_test  (torch.Tensor): Validation/test labels,   shape ``(n_test,)``.
+        model: Local DiabetesModel instance.
+        X_train, y_train: Training tensors.
+        X_test, y_test: Test/validation tensors.
     """
 
     def __init__(
@@ -283,186 +247,164 @@ class FlowerClient(fl.client.NumPyClient):
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
 
-        self.label_smoothing = 0.1
+        self.label_smoothing = config.LABEL_SMOOTHING
         self.criterion = nn.CrossEntropyLoss()
 
         self.optimizer = optim.Adam(
             self.model.parameters(),
-            lr=0.0017,
-            weight_decay=1e-4
+            lr=config.LEARNING_RATE,
+            weight_decay=config.WEIGHT_DECAY,
         )
-
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer,
-            mode='min',
-            factor=0.5,
-            patience=2
+            mode="min",
+            factor=config.LR_SCHEDULER_FACTOR,
+            patience=config.LR_SCHEDULER_PATIENCE,
         )
 
-        self.best_val_loss = float('inf')
-        self.patience = 3
-        self.no_improve_epochs = 0
-
-        logger.info(f"Client initialized on device: {self.device}")
+        logger.info("Client ready on device: %s", self.device)
 
     def get_parameters(self, config: Optional[Dict] = None) -> List[np.ndarray]:
-        """Serialise the local model's state dict into a list of numpy arrays.
-
-        This is called by Flower after training (``fit``) to send updated weights
-        back to the server.
+        """Serialise model state dict to a list of numpy arrays.
 
         Args:
-            config (dict, optional): Configuration dict from the server (unused).
+            config: Unused config dict from Flower.
 
         Returns:
-            list[np.ndarray]: One array per model parameter tensor (in state_dict order).
+            List of numpy arrays — one per state_dict entry.
         """
         return [val.cpu().numpy() for _, val in self.model.state_dict().items()]
 
     def set_parameters(self, parameters: List[np.ndarray]) -> None:
         """Load server-provided parameters into the local model.
 
-        Handles common shape mismatches that can occur between server and client
-        model versions:
-            1. Exact shape match         → direct assignment
-            2. Extra leading dim [1, N]  → squeeze(0)
-            3. Extra trailing dim [N, 1] → squeeze(1)
-            4. Same element count        → reshape
-            5. Server has more elements  → truncate + reshape
-            6. Server has fewer elements → zero-pad + reshape
+        Handles shape mismatches (extra dims, element-count matches, truncation,
+        zero-padding) that can occur across FL framework versions.
 
         Args:
-            parameters (list[np.ndarray]): Parameter arrays from the server,
-                in the same order as ``model.state_dict()``.
+            parameters: List of numpy arrays from the server.
         """
         try:
             state_dict = self.model.state_dict()
-            param_dict = {name: param for name, param in zip(state_dict.keys(), parameters)}
+            param_dict = {
+                name: param for name, param in zip(state_dict.keys(), parameters)
+            }
 
             for name, param in state_dict.items():
-                if name in param_dict:
-                    server_param = param_dict[name]
+                if name not in param_dict:
+                    continue
+                server_param = param_dict[name]
+                if isinstance(server_param, np.ndarray):
+                    server_param = torch.from_numpy(server_param)
 
-                    if isinstance(server_param, np.ndarray):
-                        server_param = torch.from_numpy(server_param)
-
-                    if param.shape == server_param.shape:
-                        state_dict[name] = server_param.to(self.device)
-                    elif len(server_param.shape) > len(param.shape) and server_param.shape[0] == 1:
-                        state_dict[name] = server_param.squeeze(0).to(self.device)
-                    elif len(server_param.shape) > len(param.shape) and server_param.shape[1] == 1:
-                        state_dict[name] = server_param.squeeze(1).to(self.device)
-                    elif server_param.numel() == param.numel():
-                        state_dict[name] = server_param.reshape_as(param).to(self.device)
-                    else:
-                        logger.warning(
-                            f"Shape mismatch for {name}: expected {param.shape}, got {server_param.shape}"
+                if param.shape == server_param.shape:
+                    state_dict[name] = server_param.to(self.device)
+                elif len(server_param.shape) > len(param.shape) and server_param.shape[0] == 1:
+                    state_dict[name] = server_param.squeeze(0).to(self.device)
+                elif len(server_param.shape) > len(param.shape) and server_param.shape[1] == 1:
+                    state_dict[name] = server_param.squeeze(1).to(self.device)
+                elif server_param.numel() == param.numel():
+                    state_dict[name] = server_param.reshape_as(param).to(self.device)
+                else:
+                    logger.warning(
+                        "Shape mismatch for %s: expected %s, got %s",
+                        name, param.shape, server_param.shape,
+                    )
+                    if server_param.numel() >= param.numel():
+                        state_dict[name] = (
+                            server_param.flatten()[: param.numel()]
+                            .reshape(param.shape)
+                            .to(self.device)
                         )
-                        if server_param.numel() >= param.numel():
-                            state_dict[name] = (
-                                server_param.flatten()[:param.numel()].reshape(param.shape).to(self.device)
-                            )
-                        else:
-                            temp = torch.zeros_like(param, device=self.device)
-                            flat_temp = temp.flatten()
-                            flat_temp[:server_param.numel()] = server_param.flatten()
-                            state_dict[name] = flat_temp.reshape(param.shape)
+                    else:
+                        temp = torch.zeros_like(param, device=self.device)
+                        temp.flatten()[: server_param.numel()] = server_param.flatten()
+                        state_dict[name] = temp
 
             self.model.load_state_dict(state_dict, strict=False)
 
         except Exception as e:
-            logger.error(f"Error in set_parameters: {str(e)}")
-            logger.error("Attempting to load parameters with simplified method...")
+            logger.error("set_parameters failed: %s — trying simplified load.", e)
             try:
-                for i, (name, param) in enumerate(self.model.named_parameters()):
+                for i, (_, param) in enumerate(self.model.named_parameters()):
                     if i < len(parameters):
                         param.data = torch.from_numpy(parameters[i]).to(self.device)
-                logger.info("Successfully loaded parameters with simplified method")
+                logger.info("Simplified parameter load succeeded.")
             except Exception as e2:
-                logger.critical(f"Critical error in parameter loading: {str(e2)}")
-                logger.info("Reinitializing model weights...")
+                logger.critical("Critical parameter load error: %s — reinitialising.", e2)
                 self.model.apply(self._init_weights)
 
     def fit(
         self, parameters: List[np.ndarray], config: Dict
     ) -> Tuple[List[np.ndarray], int, Dict]:
-        """Load global parameters, run local training, return updated weights.
+        """Load global params, run local training, return updated weights.
+
+        FIX: X_train / y_train are already PyTorch tensors from load_diabetes_data().
+        Previously they were redundantly wrapped in torch.FloatTensor() /
+        torch.LongTensor() constructors on every round, creating unnecessary copies.
+        Now they are used directly.
 
         Training applies:
-            - Standard cross-entropy loss
-            - Explicit L2 regularisation (weight decay term)
-            - Label smoothing (10 % by default)
-            - FedProx proximal term (``μ/2 · ‖w_local − w_global‖²``)
-            - Early stopping with patience=3 based on validation loss
+            - CrossEntropy + L2 regularisation + label smoothing + FedProx term
+            - Early stopping (patience from config)
+            - ReduceLROnPlateau scheduling
 
         Args:
-            parameters (list[np.ndarray]): Global model weights from the server.
-            config (dict): Training config with optional keys:
-                - ``epochs`` (int): Local epochs per round. Default: 1.
-                - ``batch_size`` (int): Mini-batch size. Default: 32.
-                - ``proximal_mu`` (float): FedProx μ. Default: 0.2.
-                - ``weight_decay`` (float): L2 coefficient. Default: 1e-4.
+            parameters: Global model weights from the server.
+            config: Training config dict with epochs, batch_size, proximal_mu, weight_decay.
 
         Returns:
-            tuple: ``(updated_parameters, num_train_examples, metrics)``
-                where ``metrics`` is an empty dict (metrics reported in ``evaluate``).
+            (updated_params, num_train_samples, {})
         """
         self.set_parameters(parameters)
 
         epochs = config.get("epochs", 1)
         batch_size = config.get("batch_size", 32)
-        proximal_mu = config.get("proximal_mu", 0.2)
+        proximal_mu = config.get("proximal_mu", 0.1)
         weight_decay = config.get("weight_decay", 1e-4)
 
-        # Snapshot of global params for FedProx proximal term
-        if proximal_mu > 0:
-            global_params = [p.detach().clone() for p in self.model.parameters()]
+        # Snapshot global params for FedProx proximal term
+        global_params = [p.detach().clone() for p in self.model.parameters()] if proximal_mu > 0 else []
 
-        train_dataset = data.TensorDataset(
-            torch.FloatTensor(self.X_train),
-            torch.LongTensor(self.y_train)
-        )
+        # FIX: X_train / y_train are already tensors — no redundant constructor call
+        train_dataset = data.TensorDataset(self.X_train, self.y_train)
         train_loader = data.DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            drop_last=True
+            train_dataset, batch_size=batch_size, shuffle=True, drop_last=True
         )
 
         self.model.train()
         best_params = None
-        best_val_loss = float('inf')
+        best_val_loss = float("inf")
         patience = 3
-        no_improve_epochs = 0
+        no_improve = 0
 
         for epoch in range(epochs):
             epoch_loss = 0.0
 
             for batch_x, batch_y in train_loader:
-                batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
+                batch_x = batch_x.to(self.device)
+                batch_y = batch_y.to(self.device)
 
                 self.optimizer.zero_grad()
                 outputs = self.model(batch_x)
-
                 loss = self.criterion(outputs, batch_y)
 
-                # Explicit L2 regularisation (supplements weight_decay in Adam)
-                l2_reg = torch.tensor(0., device=self.device)
-                for param in self.model.parameters():
-                    l2_reg += torch.norm(param)
-                loss += weight_decay * l2_reg
+                # Explicit L2 regularisation
+                l2_reg = sum(torch.norm(p) for p in self.model.parameters())
+                loss = loss + weight_decay * l2_reg
 
-                # Label smoothing: blend hard targets with uniform distribution
+                # Label smoothing
                 if self.label_smoothing > 0:
-                    smooth_loss = -F.log_softmax(outputs, dim=1).mean(dim=1).mean()
-                    loss = (1 - self.label_smoothing) * loss + self.label_smoothing * smooth_loss
+                    smooth = -F.log_softmax(outputs, dim=1).mean(dim=1).mean()
+                    loss = (1 - self.label_smoothing) * loss + self.label_smoothing * smooth
 
-                # FedProx proximal term: discourage client drift from global model
-                if proximal_mu > 0:
-                    proximal_term = 0.
-                    for local_param, global_param in zip(self.model.parameters(), global_params):
-                        proximal_term += (local_param - global_param).norm(2)
-                    loss += (proximal_mu / 2) * proximal_term
+                # FedProx proximal term
+                if proximal_mu > 0 and global_params:
+                    prox = sum(
+                        (lp - gp).norm(2)
+                        for lp, gp in zip(self.model.parameters(), global_params)
+                    )
+                    loss = loss + (proximal_mu / 2) * prox
 
                 loss.backward()
                 self.optimizer.step()
@@ -472,21 +414,22 @@ class FlowerClient(fl.client.NumPyClient):
             self.scheduler.step(val_loss)
 
             logger.info(
-                f"Epoch {epoch+1}/{epochs} - "
-                f"Train Loss: {epoch_loss/len(self.X_train):.4f}, "
-                f"Val Loss: {val_loss:.4f}, "
-                f"Val Acc: {val_metrics['accuracy']:.4f}"
+                "Epoch %d/%d — train_loss=%.4f val_loss=%.4f val_acc=%.4f",
+                epoch + 1, epochs,
+                epoch_loss / len(self.X_train),
+                val_loss,
+                val_metrics["accuracy"],
             )
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_params = [p.detach().cpu().numpy() for p in self.model.parameters()]
-                no_improve_epochs = 0
+                no_improve = 0
             else:
-                no_improve_epochs += 1
-                if no_improve_epochs >= patience:
-                    logger.info(f"Early stopping at epoch {epoch+1}, loading best model...")
-                    if best_params is not None:
+                no_improve += 1
+                if no_improve >= patience:
+                    logger.info("Early stopping at epoch %d.", epoch + 1)
+                    if best_params:
                         self.set_parameters(best_params)
                     break
 
@@ -495,194 +438,151 @@ class FlowerClient(fl.client.NumPyClient):
     def _evaluate_validation(self) -> Tuple[float, Dict[str, float]]:
         """Compute validation loss and accuracy on the local test split.
 
-        Temporarily switches the model to eval mode (disables dropout/batchnorm
-        training behaviour), then restores train mode.
-
         Returns:
-            tuple: ``(val_loss, metrics_dict)`` where ``metrics_dict`` contains
-                ``{"accuracy": float}`` with value in [0, 1].
+            (val_loss, {"accuracy": float})
         """
         self.model.eval()
-        val_loss = 0.0
-        correct = 0
-        total = 0
-
         with torch.no_grad():
-            X_test_tensor = torch.FloatTensor(self.X_test).to(self.device)
-            y_test_tensor = torch.LongTensor(self.y_test).to(self.device)
-
-            outputs = self.model(X_test_tensor)
-            val_loss = self.criterion(outputs, y_test_tensor).item()
-
-            _, predicted = torch.max(outputs.data, 1)
-            total = y_test_tensor.size(0)
-            correct = (predicted == y_test_tensor).sum().item()
-
+            X = self.X_test.to(self.device)
+            y = self.y_test.to(self.device)
+            outputs = self.model(X)
+            loss = self.criterion(outputs, y).item()
+            _, predicted = torch.max(outputs, 1)
+            acc = (predicted == y).sum().item() / y.size(0)
         self.model.train()
-        return val_loss, {"accuracy": correct / total if total > 0 else 0.0}
+        return loss, {"accuracy": acc}
 
     def evaluate(
         self, parameters: List[np.ndarray], config: Dict
     ) -> Tuple[float, int, Dict[str, float]]:
-        """Load global parameters and evaluate on the local test set.
-
-        Computes a comprehensive set of classification metrics. Handles the edge
-        case where the model predicts only one class (sets precision/recall/F1 to 0).
+        """Load global params and evaluate on the local test set.
 
         Args:
-            parameters (list[np.ndarray]): Global model weights to evaluate.
-            config (dict): Evaluation config (``round`` key present).
+            parameters: Global model weights to evaluate.
+            config: Evaluation config.
 
         Returns:
-            tuple: ``(loss, num_test_examples, metrics)`` where ``metrics`` is a
-                dict with keys: ``accuracy``, ``precision``, ``recall``, ``f1_score``.
+            (loss, num_test_samples, metrics_dict)
+            metrics_dict keys: accuracy, precision, recall, f1_score
         """
         self.set_parameters(parameters)
         self.model.eval()
 
         with torch.no_grad():
-            X_test_tensor = torch.FloatTensor(self.X_test).to(self.device)
-            y_test_tensor = torch.LongTensor(self.y_test).to(self.device)
-
-            outputs = self.model(X_test_tensor)
-            loss = self.criterion(outputs, y_test_tensor).item()
-
-            _, predicted = torch.max(outputs.data, 1)
-            correct = (predicted == y_test_tensor).sum().item()
-            accuracy = correct / len(y_test_tensor)
-
-            y_true = y_test_tensor.cpu().numpy()
+            X = self.X_test.to(self.device)
+            y = self.y_test.to(self.device)
+            outputs = self.model(X)
+            loss = self.criterion(outputs, y).item()
+            _, predicted = torch.max(outputs, 1)
+            accuracy = (predicted == y).sum().item() / len(y)
+            y_true = y.cpu().numpy()
             y_pred = predicted.cpu().numpy()
 
-            if len(np.unique(y_pred)) == 1:
-                # Model collapsed to predicting a single class — metrics undefined
-                precision = recall = f1 = 0.0
-            else:
-                precision = precision_score(y_true, y_pred, average='weighted', zero_division=0)
-                recall = recall_score(y_true, y_pred, average='weighted', zero_division=0)
-                f1 = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+        if len(np.unique(y_pred)) == 1:
+            precision = recall = f1 = 0.0
+        else:
+            precision = precision_score(y_true, y_pred, average="weighted", zero_division=0)
+            recall = recall_score(y_true, y_pred, average="weighted", zero_division=0)
+            f1 = f1_score(y_true, y_pred, average="weighted", zero_division=0)
 
-            logger.info(
-                f"Evaluation - Loss: {loss:.4f}, "
-                f"Accuracy: {accuracy:.4f}, "
-                f"Precision: {precision:.4f}, "
-                f"Recall: {recall:.4f}, "
-                f"F1: {f1:.4f}"
-            )
-
+        logger.info(
+            "Eval — loss=%.4f acc=%.4f prec=%.4f rec=%.4f f1=%.4f",
+            loss, accuracy, precision, recall, f1,
+        )
         return float(loss), len(self.X_test), {
             "accuracy": float(accuracy),
             "precision": float(precision),
             "recall": float(recall),
-            "f1_score": float(f1)
+            "f1_score": float(f1),
         }
 
 
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
 def get_local_ip() -> str:
-    """Determine the machine's primary LAN IP address.
-
-    Uses a UDP socket connect trick — connecting to an external address causes
-    the OS to select the appropriate outgoing interface without actually sending
-    any data.
-
-    Returns:
-        str: Local IP address string (e.g. ``"192.168.1.105"``), or
-            ``"0.0.0.0"`` if the address cannot be determined.
-    """
+    """Return the machine's primary LAN IP address, or '0.0.0.0' on failure."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
+        ip = s.getsockname()[0]
         s.close()
-        return local_ip
+        return ip
     except Exception as e:
-        logger.warning(f"Could not determine local IP address: {e}")
+        logger.warning("Could not determine local IP: %s", e)
         return "0.0.0.0"
 
 
-def run_client() -> None:
-    """Entry point: parse CLI args, load data, and start the Flower client.
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
-    Argument parsing:
-        --server-address (str): ``HOST:PORT`` of the Flower server.
-            Default: ``SERVER_IP:8080``.
-        --client-id (int): Unique identifier for this client. *Required.*
-            Determines which dataset partition file to load.
-        --batch-size (int): Mini-batch size for local training.
-            Default: ``32``.
+def run_client() -> None:
+    """Parse CLI args, load dataset, and start the Flower FL client.
+
+    CLI arguments:
+        --server-address  HOST:PORT of the Flower server. Defaults to config value.
+                          Override server IP with FL_SERVER_IP env var.
+        --client-id       Required. Determines dataset partition (1 or 2).
+        --batch-size      Mini-batch size for local training.
 
     Raises:
-        SystemExit: If a fatal error occurs during data loading or server connection.
+        SystemExit: On fatal data or connection errors.
     """
     parser = argparse.ArgumentParser(
-        description='Federated Learning Client for Diabetes Prediction'
+        description="Federated Learning Client — Diabetes Risk Prediction"
     )
     parser.add_argument(
-        '--server-address', type=str, default=f"{SERVER_IP}:8080",
-        help='Address of the server in the format host:port (default: SERVER_IP:8080)'
+        "--server-address",
+        type=str,
+        default=config.SERVER_ADDRESS,
+        help=f"Server address host:port (default: {config.SERVER_ADDRESS}). "
+             f"Set FL_SERVER_IP env var to change the IP.",
     )
     parser.add_argument(
-        '--client-id', type=int, required=True,
-        help='Unique identifier for this client (required)'
+        "--client-id", type=int, required=True,
+        help="Unique client ID (1 or 2). Determines which dataset partition is used.",
     )
     parser.add_argument(
-        '--batch-size', type=int, default=32,
-        help='Batch size for training (default: 32)'
+        "--batch-size", type=int, default=config.BATCH_SIZE,
+        help=f"Training batch size (default: {config.BATCH_SIZE}).",
     )
 
     args = parser.parse_args()
 
     # Select dataset partition based on client ID
-    if args.client_id == 1:
-        dataset_file = 'diabetes_non_negative_part1_2000.csv'
-        logger.info(f"Client {args.client_id}: Loading dataset part 1")
-    elif args.client_id == 2:
-        dataset_file = 'diabetes_non_negative_part2_2000.csv'
-        logger.info(f"Client {args.client_id}: Loading dataset part 2")
-    else:
-        dataset_file = 'diabetes_non_negative_part1_2000.csv'
-        logger.info(f"Client {args.client_id}: Loading default dataset part 1")
+    dataset_map = {
+        1: config.DATASET_CLIENT_1,
+        2: config.DATASET_CLIENT_2,
+    }
+    dataset_file = dataset_map.get(args.client_id, config.DATASET_CLIENT_1)
+    logger.info("Client %d → dataset: %s", args.client_id, dataset_file)
 
     try:
         logger.info("=" * 50)
-        logger.info(f"Starting Federated Learning Client (ID: {args.client_id})")
+        logger.info("Starting FL Client (ID: %d)", args.client_id)
         logger.info("=" * 50)
 
         X_train, X_test, y_train, y_test = load_diabetes_data(file_path=dataset_file)
 
-        logger.info("Dataset loaded successfully:")
-        logger.info(f"- Training samples: {len(X_train)}")
-        logger.info(f"- Test samples: {len(X_test)}")
-        logger.info(f"- Number of features: {X_train.shape[1]}")
-
-        input_size = X_train.shape[1]
-        model = DiabetesModel(input_size=input_size)
-
-        logger.info("\nModel Architecture:")
-        logger.info(model)
-
-        client = FlowerClient(model, X_train, y_train, X_test, y_test)
-
-        logger.info("\nClient Configuration:")
-        logger.info("-" * 20)
-        logger.info(f"Client ID: {args.client_id}")
-        logger.info(f"Server: {args.server_address}")
-        logger.info(f"Batch Size: {args.batch_size}")
-        logger.info(f"Device: {client.device}")
-        logger.info("-" * 20)
-
-        logger.info("\nConnecting to server...")
-        fl.client.start_numpy_client(
-            server_address=args.server_address,
-            client=client
+        logger.info(
+            "Dataset ready — train=%d test=%d features=%d",
+            len(X_train), len(X_test), X_train.shape[1],
         )
 
-        logger.info("Client finished successfully!")
+        model = DiabetesModel(input_size=X_train.shape[1])
+        client = FlowerClient(model, X_train, y_train, X_test, y_test)
+
+        logger.info("Connecting to %s …", args.server_address)
+        fl.client.start_numpy_client(
+            server_address=args.server_address,
+            client=client,
+        )
+        logger.info("Client finished successfully.")
 
     except Exception as e:
-        logger.error(f"Error in client: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
+        logger.error("Fatal error: %s", e, exc_info=True)
         sys.exit(1)
 
 
