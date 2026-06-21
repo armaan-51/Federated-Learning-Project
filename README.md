@@ -62,7 +62,7 @@ After training, the server exposes a **FastAPI REST API** for real-time diabetes
 │  │  (local DB) │                                         │
 │  └─────────────┘                                         │
 │                                                          │
-│  ← Only model weights travel the network, never data →  │
+│  ← Only model weights travel the network, never data →   │
 └──────────────────────────────────────────────────────────┘
 ```
 
